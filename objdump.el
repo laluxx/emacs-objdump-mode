@@ -7,6 +7,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'hexl)
 
 ;;; Faces
 
@@ -50,6 +51,10 @@
   "Name of object file currently being examined with objdump-mode, if any.")
 (make-variable-buffer-local 'objdump-file-name)
 
+(defvar objdump-binary-buffer nil
+  "Buffer containing the binary file in hexl-mode.")
+(make-variable-buffer-local 'objdump-binary-buffer)
+
 (defvar objdump-symbol-table nil
   "Symbol table for current buffer.")
 (make-variable-buffer-local 'objdump-symbol-table)
@@ -64,13 +69,102 @@
     (define-key map "s" 'imenu)
     (define-key map "i" 'imenu)
     (define-key map "g" 'objdump-revert)
-    (define-key map "k" 'objdump-previous-function)
-    (define-key map "j" 'objdump-next-function)
     (define-key map "p" 'objdump-previous-function)
     (define-key map "n" 'objdump-next-function)
     (define-key map "q" 'kill-this-buffer)
+    (define-key map (kbd "C-n") 'objdump-next-line)
+    (define-key map (kbd "C-p") 'objdump-previous-line)
+    (define-key map (kbd "C-f") 'objdump-forward-byte)
+    (define-key map (kbd "C-b") 'objdump-backward-byte)
+    (define-key map (kbd "C-a") 'objdump-move-beginning-of-line)
+    (define-key map (kbd "C-e") 'objdump-move-end-of-line)
+    (define-key map (kbd "RET") 'objdump-visit-address-in-hexl)
     map)
   "Keymap for `objdump-mode'.")
+
+
+(defun objdump-get-address-at-point ()
+  "Extract the hexadecimal address from the current line in objdump output.
+Returns nil if no address is found."
+  (save-excursion
+    (beginning-of-line)
+    (when (looking-at "^ *\\([0-9a-f]+\\):")
+      (string-to-number (match-string 1) 16))))
+
+(defun objdump-ensure-hexl-buffer ()
+  "Ensure we have a hexl-mode buffer for the binary file.
+Returns the buffer or nil if the binary file cannot be found."
+  (unless (and objdump-binary-buffer
+               (buffer-live-p objdump-binary-buffer))
+    (when (and objdump-file-name
+               (file-exists-p objdump-file-name))  ; Add check for file existence
+      (let ((buf (find-file-noselect objdump-file-name)))
+        (with-current-buffer buf
+          (unless (eq major-mode 'hexl-mode)
+            (hexl-mode))
+          (setq objdump-binary-buffer buf)))))
+  objdump-binary-buffer)
+
+(defun objdump-get-byte-offset-in-line ()
+  "Get the byte offset from the start of the line based on point position.
+Returns nil if not on a hex byte."
+  (when-let* ((range (objdump--get-hex-range))
+              (start (car range))
+              (end (cdr range))
+              (point-in-range (and (>= (point) start) (< (point) end))))
+    (let ((byte-count 0))
+      (save-excursion
+        (goto-char start)
+        (while (< (point) (min (point) end))
+          (when (looking-at "[0-9a-f]")
+            (forward-char)
+            (when (looking-at "[0-9a-f]")
+              (setq byte-count (1+ byte-count)))
+            (forward-char))
+          (skip-chars-forward " ")))
+      byte-count)))
+
+(defvar-local objdump-hexl-window-shrunk nil
+  "Flag indicating whether the hexl window has been shrunk.")
+
+(defun objdump-visit-address-in-hexl ()
+  "Visit the address from current objdump line in a hexl-mode buffer."
+  (interactive)
+  (let ((addr (objdump-get-address-at-point))
+        (hexl-buf-name (file-name-nondirectory objdump-file-name)))
+    (unless addr
+      (user-error "No valid address found on current line"))
+    (unless objdump-file-name
+      (user-error "No binary file path stored"))
+    (unless (file-exists-p objdump-file-name)
+      (user-error "Binary file %s not found" objdump-file-name))
+    
+    ;; Find or create the buffer
+    (find-file-other-window objdump-file-name)
+    (unless (eq major-mode 'hexl-mode)
+      (hexl-mode))
+    (unless objdump-hexl-window-shrunk
+      (shrink-window-horizontally 27)
+      (setq objdump-hexl-window-shrunk t))
+    (hexl-goto-address addr)))
+
+;; (defun objdump-visit-address-in-hexl ()
+;;   "Visit the address from current objdump line in a hexl-mode buffer."
+;;   (interactive)
+;;   (let ((addr (objdump-get-address-at-point))
+;;         (hexl-buf-name (file-name-nondirectory objdump-file-name)))
+;;     (unless addr
+;;       (user-error "No valid address found on current line"))
+;;     (unless objdump-file-name
+;;       (user-error "No binary file path stored"))
+;;     (unless (file-exists-p objdump-file-name)
+;;       (user-error "Binary file %s not found" objdump-file-name))
+    
+;;     ;; Find or create the buffer
+;;     (find-file-other-window objdump-file-name)
+;;     (unless (eq major-mode 'hexl-mode)
+;;       (hexl-mode))
+;;     (hexl-goto-address addr)))
 
 (defvar objdump-extensions
   '(".o"                                ; compiled object file
@@ -269,6 +363,166 @@
 
 
 
+(defun objdump--line-has-hex-p ()
+  "Return t if current line has hex instruction bytes."
+  (save-excursion
+    (beginning-of-line)
+    (looking-at "^\\s-*[0-9a-f]+:\\s-+[0-9a-f]")))
+
+(defun objdump--get-hex-range ()
+  "Get the start and end positions of hex bytes on current line.
+Returns (start . end) positions, or nil if not on a hex line."
+  (save-excursion
+    (beginning-of-line)
+    (when (looking-at "^\\s-*[0-9a-f]+:\\s-+\\([0-9a-f ]\\{2,\\}\\)\\s-+\\S-")
+      (cons (match-beginning 1) (match-end 1)))))
+
+(defun objdump--find-nearest-hex-position (target-column)
+  "Find nearest hex position to TARGET-COLUMN in current line.
+Returns point position of nearest hex digit, or nil if none found."
+  (when-let* ((range (objdump--get-hex-range))
+              (start (car range))
+              (end (cdr range)))
+    (save-excursion
+      ;; Get column positions of all hex digits
+      (let ((positions '())
+            (min-diff nil)
+            (best-pos nil))
+        (goto-char start)
+        (while (< (point) end)
+          (when (looking-at "[0-9a-f]")
+            (let* ((cur-col (current-column))
+                   (diff (abs (- cur-col target-column))))
+              (when (or (null min-diff) (<= diff min-diff))
+                (setq min-diff diff)
+                (setq best-pos (point)))))
+          (forward-char))
+        best-pos))))
+
+(defun objdump-forward-byte ()
+  "Smart forward movement through hex bytes."
+  (interactive)
+  (when-let ((range (objdump--get-hex-range)))
+    (let ((hex-end (cdr range)))
+      (cond
+       ;; On first digit of a pair, move to second digit
+       ((and (< (point) hex-end)
+             (looking-at "[0-9a-f]")
+             (not (looking-back "[0-9a-f]" (1- (point)))))
+        (forward-char))
+       
+       ;; On second digit or space, move to next pair or wrap
+       ((< (point) hex-end)
+        (forward-char)
+        (skip-chars-forward " ")
+        (when (>= (point) hex-end)
+          ;; At end of line, try to wrap
+          (when (objdump--next-hex-line)
+            (beginning-of-line)
+            (when (looking-at "^\\s-*[0-9a-f]+:\\s-+")
+              (goto-char (match-end 0))))))))))
+
+(defun objdump-backward-byte ()
+  "Move backward through hex bytes one character at a time, with wrapping."
+  (interactive)
+  (when-let ((range (objdump--get-hex-range)))
+    (let ((hex-start (car range)))
+      (cond
+       ;; Case 1: We're after hex-start, handle normal backward movement
+       ((> (point) hex-start)
+        (backward-char)
+        ;; If we landed on whitespace, skip back to previous hex digit
+        (when (looking-at "\\s-")
+          (skip-chars-backward " ")
+          (when (looking-back "[0-9a-f]" (1- (point)))
+            (backward-char))))
+       
+       ;; Case 2: We're at the start of hex range, need to wrap to previous line
+       (t
+        (when (save-excursion
+                (forward-line -1)
+                (objdump--line-has-hex-p))
+          (forward-line -1)
+          (when-let* ((prev-range (objdump--get-hex-range))
+                      (prev-end (cdr prev-range)))
+            ;; Go to last hex digit of previous line
+            (goto-char prev-end)
+            (backward-char)  ; Move off potential whitespace
+            (while (and (> (point) (car prev-range))
+                        (not (looking-at "[0-9a-f]")))
+              (backward-char)))))))))
+
+
+(defun objdump--next-hex-line ()
+  "Move to next line with hex bytes, preserving column position if possible."
+  (let ((target-column (current-column)))
+    (forward-line)
+    (while (and (not (eobp))
+                (not (objdump--line-has-hex-p)))
+      (forward-line))
+    (when (objdump--line-has-hex-p)
+      (when-let ((pos (objdump--find-nearest-hex-position target-column)))
+        (goto-char pos)
+        t))))
+
+(defun objdump--prev-hex-line ()
+  "Move to previous line with hex bytes, preserving column position if possible."
+  (let ((target-column (current-column)))
+    (forward-line -1)
+    (while (and (not (bobp))
+                (not (objdump--line-has-hex-p)))
+      (forward-line -1))
+    (when (objdump--line-has-hex-p)
+      (when-let ((pos (objdump--find-nearest-hex-position target-column)))
+        (goto-char pos)
+        t))))
+
+(defun objdump-next-line ()
+  "Move to next line preserving column when possible."
+  (interactive)
+  (let ((target-column (current-column)))
+    (if (objdump--next-hex-line)
+        t  ; Column already preserved by next-hex-line
+      ;; Try to find next function
+      (when (re-search-forward "^[0-9a-f]+ <.*>:$" nil t)
+        (forward-line)
+        (when (objdump--line-has-hex-p)
+          (beginning-of-line)
+          (when (looking-at "^\\s-*[0-9a-f]+:\\s-+")
+            (goto-char (match-end 0))))))))
+
+(defun objdump-previous-line ()
+  "Move to previous line preserving column when possible."
+  (interactive)
+  (let ((target-column (current-column)))
+    (if (objdump--prev-hex-line)
+        t  ; Column already preserved by prev-hex-line
+      ;; Try to find previous function
+      (when (re-search-backward "^[0-9a-f]+ <.*>:$" nil t)
+        (forward-line)
+        (when (objdump--line-has-hex-p)
+          (beginning-of-line)
+          (when (looking-at "^\\s-*[0-9a-f]+:\\s-+")
+            (goto-char (match-end 0))))))))
+
+(defun objdump-move-beginning-of-line ()
+  "Move to first hex character of the line."
+  (interactive)
+  (when-let ((range (objdump--get-hex-range)))
+    (goto-char (car range))))
+
+(defun objdump-move-end-of-line ()
+  "Move to last hex character of the line."
+  (interactive)
+  (when-let ((range (objdump--get-hex-range)))
+    (goto-char (cdr range))
+    (backward-char)
+    (while (and (> (point) (car range))
+                (not (looking-at "[0-9a-f]")))
+      (backward-char))))
+
+;; Update keymap
+
 ;;;###autoload
 (define-derived-mode objdump-mode text-mode "Objdump"
   "Major mode for viewing object file disassembly.
@@ -282,7 +536,6 @@
               (lambda (&rest _)
                 (beginning-of-line)
                 (recenter 0))))
-
 
 ;;;###autoload
 (defun objdump (filename)
@@ -304,6 +557,8 @@
       (setq objdump-file-name filename))
     (message "%s... %s" command 
              (propertize "DONE" 'face '(:inherit success :weight bold)))))
+
+
 
 (provide 'objdump)
 ;;; objdump.el ends here
